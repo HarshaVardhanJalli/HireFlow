@@ -4,7 +4,7 @@
 
 HireFlow is a resume-only AI candidate search engine. It indexes PDF resumes using both BM25 (lexical) and Pinecone vector (semantic) search, fuses results with Reciprocal Rank Fusion (RRF), applies post-search filters, and optionally re-ranks candidates with a Gemini LLM evaluator.
 
-The system is split into a **FastAPI backend** (handles indexing and search) and a **Streamlit frontend** (handles UI). Both can run independently.
+The system is split into a **FastAPI backend** (handles indexing, caching, and search), a **React frontend** (modern dashboard SPA), and a legacy **Streamlit frontend**. Both frontends connect to the same API.
 
 ---
 
@@ -12,22 +12,25 @@ The system is split into a **FastAPI backend** (handles indexing and search) and
 
 ```mermaid
 graph TB
-    subgraph UI["Streamlit Frontend (streamlit/app.py)"]
-        UPLOAD[Upload Resumes]
-        SEARCH[Search Form<br>title / description / skills / location / experience]
-        RESULTS[Results Display<br>BM25 + Vector + RRF scores]
-        MEMORY[Memory & Evaluation Dashboard]
+    subgraph UI["React Frontend (frontend/src/)"]
+        DASHBOARD[Dashboard Page<br>Status lights / Stats / Recent searches]
+        SEARCH_UI[Search Page<br>Job description / Skills / Filters]
+        UPLOAD[Upload Page<br>Index controls / File tracker grid]
+        CANDIDATES[Candidates Page<br>Browse last search results]
     end
 
     subgraph API["FastAPI Backend (api/main.py)"]
-        INDEX_EP[POST /index]
+        INDEX_EP["POST /index<br>(smart incremental)"]
+        FORCE_EP["POST /index/force<br>(clear cache + reparse)"]
+        FILES_EP["GET /index/files<br>(file status tracker)"]
         SEARCH_EP[POST /search]
         STATUS_EP[GET /status]
     end
 
     subgraph CORE["Core Layer"]
-        INGESTION[ingestion.py<br>PDF -> Document]
-        INDEXER[hybrid_indexer.py<br>BM25 + Vector]
+        INGESTION["ingestion.py<br>PDF -> Document<br>+ parse cache + rate limit"]
+        CACHE[(parsed_cache.json<br>Gemini results cache)]
+        INDEXER[hybrid_indexer.py<br>BM25 + Vector + RRF]
         FILTERS[filters.py<br>skills / location / experience]
         RERANKER[re_ranker.py<br>LLM evaluation]
         MEMORY_RAG[memory_rag.py<br>search history]
@@ -40,9 +43,19 @@ graph TB
         EMBEDDINGS[HuggingFace<br>all-MiniLM-L6-v2]
     end
 
-    UPLOAD --> INGESTION
-    SEARCH --> SEARCH_EP
+    UPLOAD --> INDEX_EP
+    UPLOAD --> FORCE_EP
+    UPLOAD --> FILES_EP
+    SEARCH_UI --> SEARCH_EP
+    DASHBOARD --> STATUS_EP
+
     INDEX_EP --> INGESTION
+    FORCE_EP --> CACHE
+    FORCE_EP --> INGESTION
+    FILES_EP --> CACHE
+
+    INGESTION --> CACHE
+    INGESTION --> GEMINI
     INGESTION --> INDEXER
     INDEXER --> PINECONE
     INDEXER --> EMBEDDINGS
@@ -50,29 +63,68 @@ graph TB
     INDEXER --> FILTERS
     FILTERS --> RERANKER
     RERANKER --> GEMINI
-    RERANKER --> RESULTS
-    MEMORY_RAG --> MEMORY
-    EVALUATOR --> MEMORY
+    RERANKER --> SEARCH_UI
+    MEMORY_RAG --> DASHBOARD
     STATUS_EP --> INDEXER
 ```
 
 ---
 
-## Data Flow
+## Data Flow — Indexing
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant Streamlit
+    participant React
+    participant FastAPI
+    participant Ingestion
+    participant Cache as parsed_cache.json
+    participant Gemini
     participant HybridIndexer
     participant BM25
     participant Pinecone
-    participant Filters
-    participant ReRanker
-    participant Gemini
 
-    User->>Streamlit: Enter search query + filters
-    Streamlit->>HybridIndexer: search_resumes(query, top_k)
+    User->>React: Click "Index N New Resumes"
+    React->>FastAPI: POST /index
+    FastAPI->>Ingestion: load_resumes(directory)
+
+    loop For each PDF
+        Ingestion->>Cache: Is this file cached?
+        alt Cached
+            Cache-->>Ingestion: Return parsed metadata (instant)
+        else Not cached
+            Ingestion->>Gemini: Parse resume text (with 4s rate-limit)
+            Gemini-->>Ingestion: {name, skills, location, experience}
+            Ingestion->>Cache: Save result to cache
+        end
+        Ingestion->>Ingestion: Create Document object
+    end
+
+    Ingestion-->>FastAPI: List of Document objects
+    FastAPI->>HybridIndexer: index_resumes(documents)
+    HybridIndexer->>BM25: Build BM25 index (in-memory)
+    HybridIndexer->>Pinecone: Embed + upsert vectors
+
+    FastAPI-->>React: {indexed: 50, cached: 45, new: 5}
+    React->>User: Show success toast + refresh file tracker
+```
+
+---
+
+## Data Flow — Searching
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant React
+    participant FastAPI
+    participant HybridIndexer
+    participant BM25
+    participant Pinecone
+
+    User->>React: Enter job description + click Search
+    React->>FastAPI: POST /search {query, top_k}
+    FastAPI->>HybridIndexer: search_resumes(query, top_k)
 
     HybridIndexer->>BM25: get_scores(query_tokens)
     BM25-->>HybridIndexer: bm25_scores[]
@@ -80,18 +132,61 @@ sequenceDiagram
     HybridIndexer->>Pinecone: query(embedding, top_k*2)
     Pinecone-->>HybridIndexer: vector_results[]
 
-    HybridIndexer->>HybridIndexer: combine_results() -- RRF fusion
-    HybridIndexer-->>Streamlit: candidates [bm25_score, vector_score, combined_score]
+    HybridIndexer->>HybridIndexer: combine_results() — RRF fusion
+    HybridIndexer-->>FastAPI: candidates [{bm25_score, vector_score, combined_score}]
 
-    Streamlit->>Filters: apply_filters(skills, location, experience)
-    Filters-->>Streamlit: filtered_candidates
+    FastAPI-->>React: SearchResponse
+    React->>User: Display ranked candidate cards with scores + skills
+```
 
-    Streamlit->>ReRanker: re_rank_candidates(top_5, query)
-    ReRanker->>Gemini: evaluate each candidate
-    Gemini-->>ReRanker: strengths / gaps / risks / summary
-    ReRanker-->>Streamlit: CandidateEvaluation[fit_score 0-100]
+---
 
-    Streamlit->>User: Display ranked results with all scores
+## Data Flow — File Status Tracking
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant React
+    participant FastAPI
+    participant Cache as parsed_cache.json
+    participant Disk as data/resumes/
+
+    User->>React: Open Upload tab
+    React->>FastAPI: GET /index/files
+    FastAPI->>Disk: List all PDF filenames
+    FastAPI->>Cache: Load cached entries
+    FastAPI->>FastAPI: Compare: which files are cached vs pending
+    FastAPI-->>React: {files: [{filename, indexed, name, skills}], total, indexed_count, pending_count}
+    React->>User: Show file cards (green=cached, amber=pending) + filter pills
+```
+
+---
+
+## Caching & Rate Limiting Architecture
+
+```
+data/resumes/
+├── alice_smith.pdf          ──> cached in parsed_cache.json ──> INSTANT load
+├── bob_jones.pdf            ──> cached in parsed_cache.json ──> INSTANT load
+├── new_candidate.pdf        ──> NOT in cache ──> Gemini call (4s delay) ──> save to cache
+└── another_new.pdf          ──> NOT in cache ──> Gemini call (4s delay) ──> save to cache
+
+parsed_cache.json:
+{
+  "alice_smith.pdf": {
+    "candidate_id": "c_alice_smith",
+    "name": "Alice Smith",
+    "skills": ["Python", "SQL", "AWS"],
+    "location": "New York",
+    "experience": 5
+  },
+  "bob_jones.pdf": { ... }
+}
+
+Rate limiting:
+  - 4 seconds between Gemini calls (~15 RPM, within free tier)
+  - On 429 error: retry with 30s / 60s / 90s exponential backoff
+  - Max 3 retries per file, then fallback to basic metadata
 ```
 
 ---
@@ -128,23 +223,67 @@ LLM Re-Ranking (optional, top-5 only)
 
 ---
 
+## API Endpoints
+
+| Method | Path | Purpose | Response |
+|---|---|---|---|
+| `POST` | `/index` | Smart incremental index (only new files) | `{indexed, cached, new, message}` |
+| `POST` | `/index/force` | Clear cache + re-parse everything | `{indexed, cached, new, message}` |
+| `GET` | `/index/files` | List all PDFs with cached/pending status | `{files[], total, indexed_count, pending_count}` |
+| `POST` | `/search` | Hybrid BM25+Vector search | `{results[{candidate_id, name, scores, skills}], total}` |
+| `GET` | `/status` | System health check | `{resumes_ready, vector_store_ready, hybrid_ready, pinecone_vector_count}` |
+
+---
+
 ## Component Descriptions
 
 | Component | File | Responsibility |
 |---|---|---|
-| FastAPI Backend | `api/main.py` | REST endpoints for index/search/status |
+| FastAPI Backend | `api/main.py` | 5 REST endpoints for index/search/status/files |
 | HybridIndexer | `core/hybrid_indexer.py` | Orchestrates BM25 + Pinecone + RRF |
 | VectorStore | `core/vector_store.py` | Pinecone upsert and query |
-| Ingestion | `core/ingestion.py` | PDF -> LangChain Document |
+| Ingestion | `core/ingestion.py` | PDF -> Document + cache + rate-limit + retry |
+| Parse Cache | `data/parsed_cache.json` | Stores Gemini parse results to avoid re-parsing |
 | ResumeParser | `core/parsing.py` | LLM-based structured field extraction |
 | ReRanker | `core/re_ranker.py` | Gemini evaluation with weighted scoring |
 | Filters | `core/filters.py` | Post-search filtering (skills/location/exp) |
 | MemoryRAG | `core/memory_rag.py` | LangChain conversation memory |
 | SearchRouter | `core/search_router.py` | Routes to shallow or deep search strategy |
 | RAGEvaluator | `core/evaluator.py` | RAGAS quality metrics |
-| SearchQuery | `utils/schemas.py` | Lightweight query context dataclass |
-| Resume | `utils/schemas.py` | Pydantic resume model |
-| CandidateEvaluation | `utils/schemas.py` | Pydantic evaluation result model |
+| React Frontend | `frontend/src/` | Modern dashboard with 4 pages |
+
+---
+
+## React Frontend Architecture
+
+```
+frontend/src/
+├── App.js                  # Global state: indexing, status, toasts, search results
+├── App.css                 # All styles (single file)
+│
+├── services/
+│   └── api.js              # fetchStatus, triggerIndex, forceIndex, fetchFileList, searchCandidates
+│
+├── components/
+│   ├── Sidebar.js          # Left nav + connection status lights (API/Vector/Search)
+│   ├── TopBar.js           # Header tabs + indexing progress pill
+│   ├── StatCards.js        # 4 metric cards with glow status dots
+│   ├── CandidateCard.js    # Expandable result card (scores, skills, details)
+│   ├── ToastContainer.js   # Notification system
+│   └── Spinner.js          # Loading indicators
+│
+└── pages/
+    ├── DashboardPage.js    # System overview, status lights, recent searches, quick actions
+    ├── SearchPage.js       # Search form -> POST /search -> display ranked results
+    ├── UploadPage.js       # Index controls, summary stats, file tracker grid
+    └── CandidatesPage.js   # Browse candidates from last search
+```
+
+**Key design decisions:**
+- **Indexing state lives in App.js** — persists across tab switches, shows banner on all pages
+- **Status polling every 10s** — keeps connection lights and stats current
+- **File tracker uses GET /index/files** — shows cached vs pending with filter pills
+- **lucide-react icons** — consistent, beautiful iconography throughout
 
 ---
 
@@ -166,22 +305,32 @@ LLM Re-Ranking (optional, top-5 only)
 ```
 fit_score = 50 + (20 * n_strengths) - (15 * n_gaps)
 clamped to [0, 100]
-
-Strengths: candidate has required skills
-Gaps:      candidate missing required skills
 ```
 
 ---
 
-## Startup Behaviour (Streamlit)
+## Startup Behaviour
 
-On cold start, `SystemManager.initialize()`:
-1. Initialises Pinecone and embeddings
-2. Checks `vector_store.get_stats()["total_vector_count"]`
-3. **If > 0**: rebuilds BM25 from local PDFs only (skips Pinecone upsert)
-4. **If 0**: runs full indexing (BM25 + Pinecone upsert)
+### FastAPI Backend
+1. Lazily initializes `HybridIndexer` on first request
+2. HybridIndexer connects to Pinecone on init
 
-A **Force Re-index Resumes** button in the sidebar triggers a full re-index at any time.
+### React Frontend
+1. Polls `GET /status` every 10 seconds
+2. Shows connection status lights (green/red glow dots)
+3. Upload page loads `GET /index/files` to show file tracker
+
+### Indexing (POST /index)
+1. Loads `parsed_cache.json`
+2. Scans `data/resumes/` for all PDFs
+3. Cached files: load metadata instantly, create Documents
+4. New files: call Gemini (4s rate-limit), save to cache, create Documents
+5. Index ALL Documents into BM25 + Pinecone
+6. Return counts: `{indexed, cached, new}`
+
+### Force Re-index (POST /index/force)
+1. Deletes `parsed_cache.json`
+2. Runs full indexing (all files treated as new)
 
 ---
 

@@ -1,10 +1,12 @@
 """
 HireFlow FastAPI backend.
 
-Exposes three endpoints:
-    POST /index   — triggers full indexing of resumes in data/resumes/
-    POST /search  — hybrid search returning ranked candidates
-    GET  /status  — returns current index stats
+Endpoints:
+    POST /index          — smart incremental index (only new files)
+    POST /index/force    — force re-index everything (clears cache)
+    GET  /index/files    — list all PDFs with their indexed/pending status
+    POST /search         — hybrid search returning ranked candidates
+    GET  /status         — returns current index stats
 
 Run with:
     python start_backend.py
@@ -14,15 +16,17 @@ or:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
-# Bootstrap sys.path so imports work whether run from repo root or api/
+# Bootstrap sys.path
 # ---------------------------------------------------------------------------
 import sys
 _project_root = Path(__file__).resolve().parent.parent
@@ -30,10 +34,10 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from core.hybrid_indexer import HybridIndexer
-from core.ingestion import load_resumes
+from core.ingestion import load_resumes, get_all_pdf_files, get_indexed_files, CACHE_FILE
 
 # ---------------------------------------------------------------------------
-# Application-level singleton — shared across requests
+# App singleton
 # ---------------------------------------------------------------------------
 app = FastAPI(title="HireFlow API", version="1.0.0")
 
@@ -50,7 +54,6 @@ _DATA_RESUMES_DIR = _project_root / "data" / "resumes"
 
 
 def get_indexer() -> HybridIndexer:
-    """Return (and lazily initialise) the shared HybridIndexer instance."""
     global _indexer
     if _indexer is None:
         _indexer = HybridIndexer()
@@ -84,7 +87,23 @@ class SearchResponse(BaseModel):
 
 class IndexResponse(BaseModel):
     indexed: int
+    cached: int
+    new: int
     message: str
+
+
+class FileStatus(BaseModel):
+    filename: str
+    indexed: bool
+    name: Optional[str] = None
+    skills: List[str] = []
+
+
+class FilesResponse(BaseModel):
+    files: List[FileStatus]
+    total: int
+    indexed_count: int
+    pending_count: int
 
 
 class StatusResponse(BaseModel):
@@ -98,27 +117,102 @@ class StatusResponse(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/index", response_model=IndexResponse, summary="Index all resumes in data/resumes/")
+@app.get("/index/files", response_model=FilesResponse,
+         summary="List all PDFs with indexed/pending status")
+def list_files():
+    """Show every PDF in data/resumes/ and whether it has been parsed & cached."""
+    all_pdfs = get_all_pdf_files(str(_DATA_RESUMES_DIR))
+    indexed = get_indexed_files()
+    indexed_set = set(indexed)
+
+    # Load cache for metadata
+    cache = {}
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE) as f:
+                cache = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    files = []
+    for pdf in all_pdfs:
+        is_indexed = pdf in indexed_set
+        entry = cache.get(pdf, {})
+        files.append(FileStatus(
+            filename=pdf,
+            indexed=is_indexed,
+            name=entry.get("name"),
+            skills=entry.get("skills", []),
+        ))
+
+    indexed_count = sum(1 for f in files if f.indexed)
+    return FilesResponse(
+        files=files,
+        total=len(files),
+        indexed_count=indexed_count,
+        pending_count=len(files) - indexed_count,
+    )
+
+
+@app.post("/index", summary="Smart incremental index (only new files)")
 def index_resumes():
-    """Load all PDFs from data/resumes/ and (re-)index them in BM25 + Pinecone."""
+    """Parse only un-cached PDFs, then index ALL into BM25 + Pinecone."""
     indexer = get_indexer()
-    resumes = load_resumes(str(_DATA_RESUMES_DIR))
+
+    progress_events: list[dict] = []
+
+    def on_progress(filename, idx, total, cached):
+        progress_events.append({
+            "filename": filename,
+            "index": idx,
+            "total": total,
+            "cached": cached,
+        })
+
+    resumes = load_resumes(
+        str(_DATA_RESUMES_DIR),
+        only_new=False,
+        progress_callback=on_progress,
+    )
+
     if not resumes:
         raise HTTPException(status_code=404, detail="No resume PDFs found in data/resumes/")
+
     ok = indexer.index_resumes(resumes)
     if not ok:
         raise HTTPException(status_code=500, detail="Indexing failed — check server logs")
-    return IndexResponse(indexed=len(resumes), message=f"Successfully indexed {len(resumes)} resumes")
+
+    cached_count = sum(1 for e in progress_events if e.get("cached"))
+    new_count = sum(1 for e in progress_events if not e.get("cached"))
+
+    return IndexResponse(
+        indexed=len(resumes),
+        cached=cached_count,
+        new=new_count,
+        message=(
+            f"Indexed {len(resumes)} resumes "
+            f"({cached_count} from cache, {new_count} newly parsed)"
+        ),
+    )
 
 
-@app.post("/search", response_model=SearchResponse, summary="Search for matching candidates")
+@app.post("/index/force", summary="Force re-index everything (clears cache)")
+def force_index():
+    """Delete the parse cache and re-process all PDFs from scratch."""
+    if CACHE_FILE.exists():
+        CACHE_FILE.unlink()
+
+    return index_resumes()
+
+
+@app.post("/search", response_model=SearchResponse,
+          summary="Search for matching candidates")
 def search(request: SearchRequest):
-    """Run a hybrid BM25 + vector search and return ranked candidates."""
     indexer = get_indexer()
     if not indexer.bm25_resumes:
         raise HTTPException(
             status_code=503,
-            detail="Index not ready. Call POST /index first."
+            detail="Index not ready. Call POST /index first.",
         )
     raw_results = indexer.search_resumes(request.query, top_k=request.top_k)
     results = [
@@ -137,9 +231,9 @@ def search(request: SearchRequest):
     return SearchResponse(results=results, total=len(results))
 
 
-@app.get("/status", response_model=StatusResponse, summary="Get current index status")
+@app.get("/status", response_model=StatusResponse,
+         summary="Get current index status")
 def status():
-    """Return BM25 and Pinecone readiness along with vector count."""
     indexer = get_indexer()
     stats = indexer.get_index_stats()
     pinecone_count = 0
