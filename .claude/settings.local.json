@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Bash(curl -s -m 5 http://localhost:8000/status)",
+      "Bash(npm install:*)"
+    ]
+  }
+}
