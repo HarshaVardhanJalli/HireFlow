@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.git
+.gitignore
+frontend/node_modules/
+frontend/build/
+*.md
+.DS_Store
+streamlit/

@@ -3,7 +3,14 @@
     "allow": [
       "Bash(npm run:*)",
       "Bash(curl -s -m 5 http://localhost:8000/status)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(npx react-scripts:*)",
+      "Bash(python3 -c \"from api.main import app; print\\(''Backend imports OK''\\)\")",
+      "Bash(source venv/bin/activate)",
+      "Bash(python3 -c \"from api.main import app; print\\([r.path for r in app.routes if hasattr\\(r,''path''\\)]\\)\")",
+      "Bash(chmod +x \"/Users/harsha/Repos/Hireflow 2/start.sh\")",
+      "Bash(pip install:*)",
+      "Bash(python3:*)"
     ]
   }
 }

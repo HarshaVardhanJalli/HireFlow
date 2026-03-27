@@ -5,6 +5,7 @@ Endpoints:
     POST /index          — smart incremental index (only new files)
     POST /index/force    — force re-index everything (clears cache)
     GET  /index/files    — list all PDFs with their indexed/pending status
+    GET  /index/files/{filename} — get full parsed details for a single resume
     POST /search         — hybrid search returning ranked candidates
     GET  /status         — returns current index stats
 
@@ -35,6 +36,7 @@ if str(_project_root) not in sys.path:
 
 from core.hybrid_indexer import HybridIndexer
 from core.ingestion import load_resumes, get_all_pdf_files, get_indexed_files, CACHE_FILE
+from utils.utils import load_pdf
 
 # ---------------------------------------------------------------------------
 # App singleton
@@ -106,6 +108,17 @@ class FilesResponse(BaseModel):
     pending_count: int
 
 
+class FileDetailResponse(BaseModel):
+    filename: str
+    indexed: bool
+    candidate_id: Optional[str] = None
+    name: Optional[str] = None
+    skills: List[str] = []
+    location: Optional[str] = None
+    experience: Optional[int] = None
+    text_preview: Optional[str] = None
+
+
 class StatusResponse(BaseModel):
     resumes_ready: bool
     vector_store_ready: bool
@@ -151,6 +164,51 @@ def list_files():
         total=len(files),
         indexed_count=indexed_count,
         pending_count=len(files) - indexed_count,
+    )
+
+
+@app.get("/index/files/{filename}", response_model=FileDetailResponse,
+         summary="Get full parsed details for a single resume")
+def file_detail(filename: str):
+    """Return full cached metadata + a text preview for a specific PDF."""
+    all_pdfs = get_all_pdf_files(str(_DATA_RESUMES_DIR))
+    if filename not in all_pdfs:
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
+
+    indexed = set(get_indexed_files())
+    is_indexed = filename in indexed
+
+    # Load cache
+    cache = {}
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE) as f:
+                cache = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    entry = cache.get(filename, {})
+
+    # Load a text preview from the actual PDF
+    text_preview = None
+    pdf_path = _DATA_RESUMES_DIR / filename
+    if pdf_path.exists():
+        try:
+            raw = load_pdf(str(pdf_path))
+            if raw:
+                text_preview = raw[:2000]  # first 2000 chars
+        except Exception:
+            pass
+
+    return FileDetailResponse(
+        filename=filename,
+        indexed=is_indexed,
+        candidate_id=entry.get("candidate_id"),
+        name=entry.get("name"),
+        skills=entry.get("skills", []),
+        location=entry.get("location"),
+        experience=entry.get("experience"),
+        text_preview=text_preview,
     )
 
 
