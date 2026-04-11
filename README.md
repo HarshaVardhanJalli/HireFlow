@@ -1,4 +1,5 @@
 # HireFlow — AI-Powered Resume Search Engine
+<img width="2048" height="1093" alt="image" src="https://github.com/user-attachments/assets/49c17bb4-76e4-4207-9c84-599214b28481" />
 
 HireFlow is an intelligent candidate search system. You give it a pile of PDF resumes and a job description, and it finds the best-matching candidates using a combination of keyword search, semantic (meaning-based) search, and AI evaluation.
 
